@@ -45,6 +45,9 @@ ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions")
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}/(USD|USDT|USDC|BTC)$")
+CRYPTO_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
+                 "stop_price", "client_order_id")
 STRING_FIELDS = ("qty", "notional", "limit_price", "stop_price", "trail_price", "trail_percent",
                  "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price")
 TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at the open",
@@ -165,14 +168,27 @@ def _f(x):
         return None
 
 
+def is_crypto(order):
+    return bool(CRYPTO.match(str(order.get("symbol", "")).strip().upper()))
+
+
+def tool_name(order):
+    """place_crypto_order for a paper crypto test (trader-risk passes it only with
+    "allow_crypto" and "paper" both true), place_stock_order for everything else."""
+    return "place_crypto_order" if is_crypto(order) else "place_stock_order"
+
+
 def tool_input(order):
-    """The exact arguments for place_stock_order: Alpaca's parameter names,
-    numbers as strings (its signature types qty, notional and prices as str).
+    """The exact arguments for place_stock_order (or place_crypto_order, where
+    "type" is "order_type"): Alpaca's parameter names, numbers as strings (its
+    signature types qty, notional and prices as str).
     "why" and "plan" are ours and are never sent."""
+    crypto = is_crypto(order)
     out = {}
-    for k in ALPACA_FIELDS:
+    for k in (CRYPTO_FIELDS if crypto else ALPACA_FIELDS):
         if k in order and order[k] is not None:
-            out[k] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
+            name = "order_type" if crypto and k == "type" else k
+            out[name] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
     return out
 
 
@@ -366,7 +382,7 @@ def render(order, idx, total, cfg, risk, state, today):
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
-        lines.append("  Claude will call place_stock_order with exactly:")
+        lines.append("  Claude will call %s with exactly:" % tool_name(order))
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
         if is_bracket(order):
@@ -384,7 +400,7 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": cfg.get("broker", "alpaca"), "tool": tool_name(order),
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -519,7 +535,7 @@ def cmd_approve(a):
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
-        print("Now call place_stock_order with exactly:")
+        print("Now call %s with exactly:" % tool_name(order))
         print(json.dumps(tool_input(order), indent=2))
         print("Claude's card shows Allow once / Deny. Then: ticket.py result --index %d --status "
               "placed|denied|failed" % a.index)
@@ -603,7 +619,8 @@ def cmd_flatten(a):
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
         or cfg.get("flat_by") or "15:55"
-    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
+    tif = "gtc" if CRYPTO.match(sym) else "day"
+    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": tif,
              "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
              % (flat_by, sym, source)}
     old = read_json(a.orders, "orders", required=False)

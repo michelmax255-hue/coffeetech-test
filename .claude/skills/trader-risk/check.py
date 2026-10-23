@@ -25,7 +25,9 @@ What blocks an order (every order):
                 a limit order without a limit price, unknown type; a bracket
                 that is not whole shares, not day / gtc, or misses a leg
   asset         options (OCC symbols) unless "allow_options": true; crypto
-                and anything that is not a stock or ETF
+                pairs (BTC/USD) unless "allow_crypto": true AND "paper": true
+                (a test environment only, never real money); anything else
+                that is not a stock or ETF
   short         selling more than you hold, unless "allow_short": true
 
 What blocks an entry (on top):
@@ -73,7 +75,7 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "allow_crypto": False, "pdt_guard": False,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -84,6 +86,8 @@ PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_lim
 TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}/(USD|USDT|USDC|BTC)$")
+CRYPTO_TIFS = {"gtc", "ioc"}
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
@@ -402,6 +406,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     batch_entries, batch_loss = 0, 0.0
     if not c.get("paper", True):
         top_warn.append("LIVE account (\"paper\": false): these orders use real money")
+    elif c.get("allow_crypto"):
+        top_warn.append("crypto is on (\"allow_crypto\": true): paper test orders only, never real money")
     top_warn.extend(win_warns)
 
     def fresh(sym):
@@ -428,6 +434,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
         value = None
+        crypto = bool(CRYPTO.match(sym))
 
         # format
         if not sym:
@@ -473,7 +480,21 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                          % (oc or "advanced_instructions"))
 
         # asset
-        if sym and OCC.match(sym.replace(" ", "")):
+        if crypto:
+            if not c.get("allow_crypto"):
+                reasons.append("asset: %s is a crypto pair; crypto is off (\"allow_crypto\": false)" % sym)
+            elif not c.get("paper", True):
+                reasons.append("asset: %s is a crypto pair; crypto is for the paper account only "
+                               "(\"paper\": false)" % sym)
+            else:
+                warns.append("paper crypto order: a test, it trades around the clock and can gap through "
+                             "a stop")
+            if bracket:
+                reasons.append("format: Alpaca has no bracket orders for crypto; send a plain order with "
+                               "the stop in the plan and set a stop alert")
+            if tif not in CRYPTO_TIFS:
+                reasons.append("format: a crypto order needs time_in_force gtc or ioc, got %r" % tif)
+        elif sym and OCC.match(sym.replace(" ", "")):
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
@@ -623,7 +644,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
+            if not crypto:               # crypto trades around the clock
+                later.extend(win_reasons)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
